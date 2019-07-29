@@ -291,6 +291,14 @@ impl Client {
         Session::with_capabilities(webdriver, cap)
     }
 
+    /// Create a new `Client` associated a exist WebDriver session
+    pub fn new_for_session_id(
+        webdriver: &str,
+        session: &str,
+    ) -> impl Future<Item = Self, Error = error::NewSessionError> {
+        Session::with_session_id(webdriver, session.to_owned())
+    }
+
     /// Get the session ID assigned by the WebDriver server to this client.
     pub fn session_id(&mut self) -> impl Future<Item = Option<String>, Error = error::CmdError> {
         self.issue(Cmd::GetSessionId).map(|v| match v {

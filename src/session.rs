@@ -15,6 +15,7 @@ use webdriver;
 use webdriver::command::WebDriverCommand;
 use webdriver::error::ErrorStatus;
 use webdriver::error::WebDriverError;
+use futures::future::{ok, err};
 
 type Ack = futures::sync::oneshot::Sender<Result<Json, error::CmdError>>;
 
@@ -328,6 +329,56 @@ impl Session {
                 panic!("unexpected webdriver error; {}", e);
             }
         }
+    }
+
+    pub(crate) fn with_session_id(
+        webdriver: &str,
+        session_id: String,
+    ) -> impl Future<Item = Client, Error = error::NewSessionError> {
+        // Where is the WebDriver server?
+        let wdb = match webdriver.parse::<url::Url>() {
+            Ok(wdb) => wdb,
+            Err(e) => {
+                return future::Either::B(future::err(error::NewSessionError::BadWebdriverUrl(e)));
+            }
+        };
+
+        // We want a tls-enabled client
+        let client = hyper::Client::builder()
+            .build::<_, hyper::Body>(hyper_tls::HttpsConnector::new(4).unwrap());
+
+        // We're going to need a channel for sending requests to the WebDriver host
+        let (tx, rx) = futures::sync::mpsc::unbounded();
+
+        // Set up our WebDriver session.
+        // We don't want to call tokio::spawn directly here, because we may not yet be executing
+        // futures. Instead, we'll use a futures::lazy to spin up the Session when the returned
+        // future is first polled, and only then do all the setup.
+        future::Either::A(future::lazy(move || {
+            tokio::spawn(Session {
+                rx,
+                ongoing: Ongoing::None,
+                c: client,
+                wdb: wdb,
+                session: Some(session_id),
+                legacy: false,
+                ua: None,
+                persist: false,
+            });
+
+            // now that the session is running, let's do the handshake
+            let mut client = Client {
+                tx: tx.clone(),
+                legacy: false,
+            };
+
+            client.session_id().then(|res| {
+                match res {
+                    Ok(_) => ok(client),
+                    Err(_) => err(error::NewSessionError::NotW3C(serde_json::Value::Null))
+                }
+            })
+        }))
     }
 
     pub(crate) fn with_capabilities(
