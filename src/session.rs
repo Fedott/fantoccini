@@ -374,8 +374,13 @@ impl Session {
 
             client.session_id().then(|res| {
                 match res {
-                    Ok(_) => ok(client),
-                    Err(_) => err(error::NewSessionError::NotW3C(serde_json::Value::Null))
+                    Ok(id) => {
+                        match id {
+                            Some(_id) => ok(client),
+                            None => err(error::NewSessionError::NotW3C(serde_json::Value::Null)),
+                        }
+                    },
+                    Err(_) => err(error::NewSessionError::NotW3C(serde_json::Value::Null)),
                 }
             })
         }))
