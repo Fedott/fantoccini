@@ -1119,6 +1119,15 @@ impl Element {
             .and_then(move |v| c.parse_lookup(v).map(move |e| Element { c: c, e }))
             .and_then(move |e| e.click())
     }
+
+    /// Check element for displayed
+    pub fn displayed(&mut self) -> impl Future<Item = bool, Error = error::CmdError> {
+        let cmd = WebDriverCommand::IsDisplayed(self.e.clone());
+        self.c.issue(cmd).and_then(|v| match v {
+            Json::Bool(v) => Ok(v),
+            v => Err(error::CmdError::NotW3C(v)),
+        })
+    }
 }
 
 impl Form {

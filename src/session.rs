@@ -527,6 +527,9 @@ impl Session {
             WebDriverCommand::GetCookies => base.join("cookie"),
             WebDriverCommand::ExecuteScript(..) if self.legacy => base.join("execute"),
             WebDriverCommand::ExecuteScript(..) => base.join("execute/sync"),
+            WebDriverCommand::IsDisplayed(ref we) => {
+                base.join(&format!("element/{}/displayed", we.id))
+            },
             WebDriverCommand::GetElementProperty(ref we, ref prop) => {
                 base.join(&format!("element/{}/property/{}", we.id, prop))
             }
