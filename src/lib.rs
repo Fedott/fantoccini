@@ -776,7 +776,7 @@ impl Client {
         &mut self,
         search: Locator,
     ) -> impl Future<Item = Element, Error = error::CmdError> {
-        self.by(search.into())
+        by(self.clone(), search.into())
     }
 
     /// Find elements on the page.
@@ -784,18 +784,7 @@ impl Client {
         &mut self,
         search: Locator,
     ) -> impl Future<Item = Vec<Element>, Error = error::CmdError> {
-        let this = self.clone();
-        self.issue(WebDriverCommand::FindElements(search.into()))
-            .and_then(move |res| {
-                let array = this.parse_lookup_all(res)?;
-                Ok(array
-                    .into_iter()
-                    .map(move |e| Element {
-                        c: this.clone(),
-                        e: e,
-                    })
-                    .collect())
-            })
+        find_all(self.clone(), search)
     }
 
     /// Wait for the given function to return `true` before proceeding.
@@ -834,8 +823,8 @@ impl Client {
         search: Locator,
     ) -> impl Future<Item = Element, Error = error::CmdError> {
         let s: webdriver::command::LocatorParameters = search.into();
-        futures::future::loop_fn(self, move |mut this| {
-            this.by(webdriver::command::LocatorParameters {
+        futures::future::loop_fn(self, move |this| {
+            by(this.clone(), webdriver::command::LocatorParameters {
                 using: s.using.clone(),
                 value: s.value.clone(),
             })
@@ -879,75 +868,12 @@ impl Client {
         let mut c = self.clone();
         c.issue(WebDriverCommand::FindElement(search.into()))
             .and_then(move |res| {
-                let f = c.parse_lookup(res);
+                let f = parse_lookup(res, c.is_legacy());
                 f.map(move |f| Form { c: c.clone(), f: f })
             })
     }
 
     // helpers
-
-    fn by(
-        &mut self,
-        locator: webdriver::command::LocatorParameters,
-    ) -> impl Future<Item = Element, Error = error::CmdError> {
-        let mut c = self.clone();
-        c.issue(WebDriverCommand::FindElement(locator))
-            .and_then(move |res| {
-                let e = c.parse_lookup(res);
-                e.map(move |e| Element { c: c.clone(), e: e })
-            })
-    }
-
-    /// Extract the `WebElement` from a `FindElement` or `FindElementElement` command.
-    fn parse_lookup(&self, res: Json) -> Result<webdriver::common::WebElement, error::CmdError> {
-        let mut res = match res {
-            Json::Object(o) => o,
-            res => return Err(error::CmdError::NotW3C(res)),
-        };
-
-        // legacy protocol uses "ELEMENT" as identifier
-        let key = if self.is_legacy() {
-            "ELEMENT"
-        } else {
-            ELEMENT_KEY
-        };
-
-        if !res.contains_key(key) {
-            return Err(error::CmdError::NotW3C(Json::Object(res)));
-        }
-
-        match res.remove(key) {
-            Some(Json::String(wei)) => {
-                return Ok(webdriver::common::WebElement::new(wei));
-            }
-            Some(v) => {
-                res.insert(key.to_string(), v);
-            }
-            None => {}
-        }
-
-        Err(error::CmdError::NotW3C(Json::Object(res)))
-    }
-
-    /// Extract `WebElement`s from a `FindElements` or `FindElementElements` command.
-    fn parse_lookup_all(
-        &self,
-        res: Json,
-    ) -> Result<Vec<webdriver::common::WebElement>, error::CmdError> {
-        let res = match res {
-            Json::Array(a) => a,
-            res => return Err(error::CmdError::NotW3C(res)),
-        };
-
-        let mut array = Vec::new();
-        for json in res {
-            let e = self.parse_lookup(json)?;
-            array.push(e);
-        }
-
-        Ok(array)
-    }
-
     fn fixup_elements(&self, args: &mut [Json]) {
         if self.is_legacy() {
             for arg in args {
@@ -961,6 +887,85 @@ impl Client {
             }
         }
     }
+}
+
+/// Find elements on the page.
+fn find_all(
+    c: Client,
+    search: Locator,
+) -> impl Future<Item = Vec<Element>, Error = error::CmdError> {
+    c.clone().issue(WebDriverCommand::FindElements(search.into()))
+        .and_then(move |res| {
+            let array = parse_lookup_all(res, c.is_legacy())?;
+            Ok(array
+                .into_iter()
+                .map(move |e| Element {
+                    c: c.clone(),
+                    e: e,
+                })
+                .collect())
+        })
+}
+
+fn by(
+    mut c: Client,
+    locator: webdriver::command::LocatorParameters,
+) -> impl Future<Item = Element, Error = error::CmdError> {
+    c.issue(WebDriverCommand::FindElement(locator))
+        .and_then(move |res| {
+            let e = parse_lookup(res, c.is_legacy());
+            e.map(move |e| Element { c: c.clone(), e: e })
+        })
+}
+
+/// Extract the `WebElement` from a `FindElement` or `FindElementElement` command.
+fn parse_lookup(res: Json, is_legacy: bool) -> Result<webdriver::common::WebElement, error::CmdError> {
+    let mut res = match res {
+        Json::Object(o) => o,
+        res => return Err(error::CmdError::NotW3C(res)),
+    };
+
+    // legacy protocol uses "ELEMENT" as identifier
+    let key = if is_legacy {
+        "ELEMENT"
+    } else {
+        ELEMENT_KEY
+    };
+
+    if !res.contains_key(key) {
+        return Err(error::CmdError::NotW3C(Json::Object(res)));
+    }
+
+    match res.remove(key) {
+        Some(Json::String(wei)) => {
+            return Ok(webdriver::common::WebElement::new(wei));
+        }
+        Some(v) => {
+            res.insert(key.to_string(), v);
+        }
+        None => {}
+    }
+
+    Err(error::CmdError::NotW3C(Json::Object(res)))
+}
+
+/// Extract `WebElement`s from a `FindElements` or `FindElementElements` command.
+fn parse_lookup_all(
+    res: Json,
+    is_legacy: bool,
+) -> Result<Vec<webdriver::common::WebElement>, error::CmdError> {
+    let res = match res {
+        Json::Array(a) => a,
+        res => return Err(error::CmdError::NotW3C(res)),
+    };
+
+    let mut array = Vec::new();
+    for json in res {
+        let e = parse_lookup(json, is_legacy)?;
+        array.push(e);
+    }
+
+    Ok(array)
 }
 
 impl Element {
@@ -1116,17 +1121,33 @@ impl Element {
         let mut c = self.c;
         let cmd = WebDriverCommand::FindElementElement(e, locator);
         c.issue(cmd)
-            .and_then(move |v| c.parse_lookup(v).map(move |e| Element { c: c, e }))
+            .and_then(move |v| parse_lookup(v, c.is_legacy()).map(move |e| Element { c: c, e }))
             .and_then(move |e| e.click())
     }
 
     /// Check element for displayed
-    pub fn displayed(&mut self) -> impl Future<Item = bool, Error = error::CmdError> {
+    pub fn displayed(&self) -> impl Future<Item = bool, Error = error::CmdError> {
         let cmd = WebDriverCommand::IsDisplayed(self.e.clone());
-        self.c.issue(cmd).and_then(|v| match v {
+        self.c.clone().issue(cmd).and_then(|v| match v {
             Json::Bool(v) => Ok(v),
             v => Err(error::CmdError::NotW3C(v)),
         })
+    }
+
+    /// Find an element on the page.
+    pub fn find(
+        &self,
+        search: Locator,
+    ) -> impl Future<Item = Element, Error = error::CmdError> {
+        by(self.c.clone(), search.into())
+    }
+
+    /// Find elements on the page.
+    pub fn find_all(
+        &self,
+        search: Locator,
+    ) -> impl Future<Item = Vec<Element>, Error = error::CmdError> {
+        find_all(self.c.clone(), search)
     }
 }
 
@@ -1144,7 +1165,7 @@ impl Form {
         self.c
             .issue(locator)
             .and_then(move |res| {
-                let f = this.parse_lookup(res);
+                let f = parse_lookup(res, this.is_legacy());
                 f.map(move |f| (this, f))
             })
             .and_then(move |(mut this, field)| {
@@ -1197,7 +1218,7 @@ impl Form {
         let locator = WebDriverCommand::FindElementElement(f, button.into());
         c.issue(locator)
             .and_then(move |res| {
-                let s = c.parse_lookup(res);
+                let s = parse_lookup(res, c.is_legacy());
                 s.map(move |s| (c, s))
             })
             .and_then(move |(mut this, submit)| {
