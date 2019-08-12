@@ -776,7 +776,7 @@ impl Client {
         &mut self,
         search: Locator,
     ) -> impl Future<Item = Element, Error = error::CmdError> {
-        by(self.clone(), search.into())
+        by(self.clone(), search.into(), None)
     }
 
     /// Find elements on the page.
@@ -784,7 +784,7 @@ impl Client {
         &mut self,
         search: Locator,
     ) -> impl Future<Item = Vec<Element>, Error = error::CmdError> {
-        find_all(self.clone(), search)
+        find_all(self.clone(), search, None)
     }
 
     /// Wait for the given function to return `true` before proceeding.
@@ -827,7 +827,7 @@ impl Client {
             by(this.clone(), webdriver::command::LocatorParameters {
                 using: s.using.clone(),
                 value: s.value.clone(),
-            })
+            }, None)
             .map(futures::future::Loop::Break)
             .or_else(move |e| {
                 if let error::CmdError::NoSuchElement(_) = e {
@@ -893,8 +893,14 @@ impl Client {
 fn find_all(
     c: Client,
     search: Locator,
+    parent_element: Option<&Element>,
 ) -> impl Future<Item = Vec<Element>, Error = error::CmdError> {
-    c.clone().issue(WebDriverCommand::FindElements(search.into()))
+    let command = match parent_element {
+        None => WebDriverCommand::FindElements(search.into()),
+        Some(el) => WebDriverCommand::FindElementElements(el.e.clone(), search.into()),
+    };
+
+    c.clone().issue(command)
         .and_then(move |res| {
             let array = parse_lookup_all(res, c.is_legacy())?;
             Ok(array
@@ -910,8 +916,14 @@ fn find_all(
 fn by(
     mut c: Client,
     locator: webdriver::command::LocatorParameters,
+    parent_element: Option<&Element>,
 ) -> impl Future<Item = Element, Error = error::CmdError> {
-    c.issue(WebDriverCommand::FindElement(locator))
+    let command = match parent_element {
+        None => WebDriverCommand::FindElement(locator),
+        Some(el) => WebDriverCommand::FindElementElement(el.e.clone(), locator),
+    };
+
+    c.issue(command)
         .and_then(move |res| {
             let e = parse_lookup(res, c.is_legacy());
             e.map(move |e| Element { c: c.clone(), e: e })
@@ -1139,7 +1151,7 @@ impl Element {
         &self,
         search: Locator,
     ) -> impl Future<Item = Element, Error = error::CmdError> {
-        by(self.c.clone(), search.into())
+        by(self.c.clone(), search.into(), Some(self))
     }
 
     /// Find elements on the page.
@@ -1147,7 +1159,7 @@ impl Element {
         &self,
         search: Locator,
     ) -> impl Future<Item = Vec<Element>, Error = error::CmdError> {
-        find_all(self.c.clone(), search)
+        find_all(self.c.clone(), search, Some(self))
     }
 }
 
