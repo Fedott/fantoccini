@@ -991,6 +991,16 @@ impl Element {
         .click()
         .await
     }
+
+    /// Check element for displayed
+    pub async fn displayed(&self) -> Result<bool, error::CmdError> {
+        let cmd = WebDriverCommand::IsDisplayed(self.e.clone());
+        let v = self.c.clone().issue(cmd).await?;
+        match v {
+            Json::Bool(v) => Ok(v),
+            v => Err(error::CmdError::NotW3C(v)),
+        }
+    }
 }
 
 impl Form {
