@@ -1,7 +1,7 @@
 use crate::error;
-use futures_core::{ready, Future};
+use futures_core::{ready, Future, Poll};
 use futures_util::future::{self, Either};
-use futures_util::{FutureExt, TryFutureExt, TryStreamExt};
+use futures_util::{TryFutureExt, TryStreamExt};
 use serde_json::Value as Json;
 use std::io;
 use std::mem;
