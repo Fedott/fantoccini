@@ -1008,12 +1008,12 @@ impl Element {
     }
 
     /// Find an element on the page.
-    pub async fn find(&mut self, search: Locator<'_>) -> Result<Element, error::CmdError> {
+    pub async fn find(&self, search: Locator<'_>) -> Result<Element, error::CmdError> {
         by(self.c.clone(), search.into(), Some(self.e.clone())).await
     }
 
     /// Find elements on the page.
-    pub async fn find_all(&mut self, search: Locator<'_>) -> Result<Vec<Element>, error::CmdError> {
+    pub async fn find_all(&self, search: Locator<'_>) -> Result<Vec<Element>, error::CmdError> {
         let res = self.c.clone()
             .issue(WebDriverCommand::FindElementElements(self.e.clone(), search.into()))
             .await?;
