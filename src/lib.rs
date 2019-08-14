@@ -129,7 +129,7 @@ use serde_json::Value as Json;
 use tokio::prelude::*;
 use tokio::sync::oneshot;
 use webdriver::command::{SendKeysParameters, WebDriverCommand};
-use webdriver::common::ELEMENT_KEY;
+use webdriver::common::{ELEMENT_KEY, WebElement};
 use webdriver::error::WebDriverError;
 
 macro_rules! via_json {
@@ -677,7 +677,7 @@ impl Client {
 
     /// Find an element on the page.
     pub async fn find(&mut self, search: Locator<'_>) -> Result<Element, error::CmdError> {
-        self.by(search.into()).await
+        by(self.clone(), search.into(), None).await
     }
 
     /// Find elements on the page.
@@ -685,7 +685,7 @@ impl Client {
         let res = self
             .issue(WebDriverCommand::FindElements(search.into()))
             .await?;
-        let array = self.parse_lookup_all(res)?;
+        let array = parse_lookup_all(self, res)?;
         Ok(array
             .into_iter()
             .map(move |e| Element {
@@ -716,14 +716,13 @@ impl Client {
     /// While this currently just spins and yields, it may be more efficient than this in the
     /// future. In particular, in time, it may only run `is_ready` again when an event occurs on
     /// the page.
-    pub async fn wait_for_find(mut self, search: Locator<'_>) -> Result<Element, error::CmdError> {
+    pub async fn wait_for_find(self, search: Locator<'_>) -> Result<Element, error::CmdError> {
         let s: webdriver::command::LocatorParameters = search.into();
         loop {
-            match self
-                .by(webdriver::command::LocatorParameters {
+            match by(self.clone(), webdriver::command::LocatorParameters {
                     using: s.using.clone(),
                     value: s.value.clone(),
-                })
+                }, None)
                 .await
             {
                 Ok(v) => break Ok(v),
@@ -763,7 +762,7 @@ impl Client {
     pub async fn form(&mut self, search: Locator<'_>) -> Result<Form, error::CmdError> {
         let l = search.into();
         let res = self.issue(WebDriverCommand::FindElement(l)).await?;
-        let f = self.parse_lookup(res)?;
+        let f = parse_lookup(self, res)?;
         Ok(Form {
             c: self.clone(),
             f: f,
@@ -771,68 +770,6 @@ impl Client {
     }
 
     // helpers
-
-    async fn by(
-        &mut self,
-        locator: webdriver::command::LocatorParameters,
-    ) -> Result<Element, error::CmdError> {
-        let res = self.issue(WebDriverCommand::FindElement(locator)).await?;
-        let e = self.parse_lookup(res)?;
-        Ok(Element {
-            c: self.clone(),
-            e: e,
-        })
-    }
-
-    /// Extract the `WebElement` from a `FindElement` or `FindElementElement` command.
-    fn parse_lookup(&self, res: Json) -> Result<webdriver::common::WebElement, error::CmdError> {
-        let mut res = match res {
-            Json::Object(o) => o,
-            res => return Err(error::CmdError::NotW3C(res)),
-        };
-
-        // legacy protocol uses "ELEMENT" as identifier
-        let key = if self.is_legacy() {
-            "ELEMENT"
-        } else {
-            ELEMENT_KEY
-        };
-
-        if !res.contains_key(key) {
-            return Err(error::CmdError::NotW3C(Json::Object(res)));
-        }
-
-        match res.remove(key) {
-            Some(Json::String(wei)) => {
-                return Ok(webdriver::common::WebElement::new(wei));
-            }
-            Some(v) => {
-                res.insert(key.to_string(), v);
-            }
-            None => {}
-        }
-
-        Err(error::CmdError::NotW3C(Json::Object(res)))
-    }
-
-    /// Extract `WebElement`s from a `FindElements` or `FindElementElements` command.
-    fn parse_lookup_all(
-        &self,
-        res: Json,
-    ) -> Result<Vec<webdriver::common::WebElement>, error::CmdError> {
-        let res = match res {
-            Json::Array(a) => a,
-            res => return Err(error::CmdError::NotW3C(res)),
-        };
-
-        let mut array = Vec::new();
-        for json in res {
-            let e = self.parse_lookup(json)?;
-            array.push(e);
-        }
-
-        Ok(array)
-    }
 
     fn fixup_elements(&self, args: &mut [Json]) {
         if self.is_legacy() {
@@ -847,6 +784,74 @@ impl Client {
             }
         }
     }
+}
+
+async fn by(
+    mut c: Client,
+    locator: webdriver::command::LocatorParameters,
+    parent: Option<WebElement>,
+) -> Result<Element, error::CmdError> {
+    let cmd = match parent {
+        None => WebDriverCommand::FindElement(locator),
+        Some(el) => WebDriverCommand::FindElementElement(el, locator),
+    };
+
+    let res = c.issue(cmd).await?;
+    let e = parse_lookup(&c, res)?;
+    Ok(Element {
+        c: c.clone(),
+        e: e,
+    })
+}
+
+/// Extract the `WebElement` from a `FindElement` or `FindElementElement` command.
+fn parse_lookup(c: &Client, res: Json) -> Result<webdriver::common::WebElement, error::CmdError> {
+    let mut res = match res {
+        Json::Object(o) => o,
+        res => return Err(error::CmdError::NotW3C(res)),
+    };
+
+    // legacy protocol uses "ELEMENT" as identifier
+    let key = if c.is_legacy() {
+        "ELEMENT"
+    } else {
+        ELEMENT_KEY
+    };
+
+    if !res.contains_key(key) {
+        return Err(error::CmdError::NotW3C(Json::Object(res)));
+    }
+
+    match res.remove(key) {
+        Some(Json::String(wei)) => {
+            return Ok(webdriver::common::WebElement::new(wei));
+        }
+        Some(v) => {
+            res.insert(key.to_string(), v);
+        }
+        None => {}
+    }
+
+    Err(error::CmdError::NotW3C(Json::Object(res)))
+}
+
+/// Extract `WebElement`s from a `FindElements` or `FindElementElements` command.
+fn parse_lookup_all(
+    c: &Client,
+    res: Json,
+) -> Result<Vec<webdriver::common::WebElement>, error::CmdError> {
+    let res = match res {
+        Json::Array(a) => a,
+        res => return Err(error::CmdError::NotW3C(res)),
+    };
+
+    let mut array = Vec::new();
+    for json in res {
+        let e = parse_lookup(c, json)?;
+        array.push(e);
+    }
+
+    Ok(array)
 }
 
 impl Element {
@@ -985,7 +990,7 @@ impl Element {
         let cmd = WebDriverCommand::FindElementElement(self.e, locator);
         let v = self.c.issue(cmd).await?;
         Element {
-            e: self.c.parse_lookup(v)?,
+            e: parse_lookup(&self.c, v)?,
             c: self.c,
         }
         .click()
@@ -1001,6 +1006,26 @@ impl Element {
             v => Err(error::CmdError::NotW3C(v)),
         }
     }
+
+    /// Find an element on the page.
+    pub async fn find(&mut self, search: Locator<'_>) -> Result<Element, error::CmdError> {
+        by(self.c.clone(), search.into(), Some(self.e.clone())).await
+    }
+
+    /// Find elements on the page.
+    pub async fn find_all(&mut self, search: Locator<'_>) -> Result<Vec<Element>, error::CmdError> {
+        let res = self.c.clone()
+            .issue(WebDriverCommand::FindElementElements(self.e.clone(), search.into()))
+            .await?;
+        let array = parse_lookup_all(&self.c, res)?;
+        Ok(array
+            .into_iter()
+            .map(move |e| Element {
+                c: self.c.clone(),
+                e: e,
+            })
+            .collect())
+    }
 }
 
 impl Form {
@@ -1014,7 +1039,7 @@ impl Form {
         let value = Json::from(value);
 
         let res = self.c.issue(locator).await?;
-        let field = self.c.parse_lookup(res)?;
+        let field = parse_lookup(&self.c, res)?;
         let mut args = vec![via_json!(&field), value];
         self.c.fixup_elements(&mut args);
         let cmd = webdriver::command::JavascriptCommandParameters {
@@ -1058,7 +1083,7 @@ impl Form {
     pub async fn submit_with(mut self, button: Locator<'_>) -> Result<Client, error::CmdError> {
         let locator = WebDriverCommand::FindElementElement(self.f, button.into());
         let res = self.c.issue(locator).await?;
-        let submit = self.c.parse_lookup(res)?;
+        let submit = parse_lookup(&self.c, res)?;
         let res = self.c.issue(WebDriverCommand::ElementClick(submit)).await?;
         if res.is_null() || res.as_object().map(|o| o.is_empty()).unwrap_or(false) {
             // geckodriver returns {} :(
