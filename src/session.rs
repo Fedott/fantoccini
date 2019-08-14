@@ -322,6 +322,45 @@ impl Session {
         }
     }
 
+    pub(crate) async fn with_session_id(
+        webdriver: &str,
+        session_id: String,
+    ) -> Result<Client, error::NewSessionError> {
+        // Where is the WebDriver server?
+        let wdb = webdriver.parse::<url::Url>();
+
+        let wdb = wdb.map_err(error::NewSessionError::BadWebdriverUrl)?;
+
+        // We want a tls-enabled client
+        let client = hyper::Client::builder()
+            .build::<_, hyper::Body>(hyper_tls::HttpsConnector::new(4).unwrap());
+
+        // We're going to need a channel for sending requests to the WebDriver host
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(Session {
+            rx,
+            ongoing: Ongoing::None,
+            c: client,
+            wdb: wdb,
+            session: Some(session_id),
+            legacy: false,
+            ua: None,
+            persist: false,
+        });
+
+        // now that the session is running, let's do the handshake
+        let mut client = Client {
+            tx: tx.clone(),
+            legacy: false,
+        };
+
+        match client.current_url().await {
+            Ok(_) => Ok(client),
+            _ => Err(error::NewSessionError::NotW3C(serde_json::Value::Null)),
+        }
+    }
+
     pub(crate) async fn with_capabilities(
         webdriver: &str,
         mut cap: webdriver::capabilities::Capabilities,
