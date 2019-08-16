@@ -1026,6 +1026,21 @@ impl Element {
             })
             .collect())
     }
+
+    /// Wait for the given function to return `true` before proceeding.
+    ///
+    /// This can be useful to wait for something to appear on the page before interacting with it.
+    /// While this currently just spins and yields, it may be more efficient than this in the
+    /// future. In particular, in time, it may only run `is_ready` again when an event occurs on
+    /// the page.
+    pub async fn wait_for<F, FF>(mut self, mut is_ready: F) -> Result<Self, error::CmdError>
+        where
+            F: FnMut(&mut Element) -> FF,
+            FF: Future<Output = Result<bool, error::CmdError>>,
+    {
+        while !is_ready(&mut self).await? {}
+        Ok(self)
+    }
 }
 
 impl Form {
