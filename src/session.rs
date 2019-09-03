@@ -495,6 +495,9 @@ impl Session {
             WebDriverCommand::IsDisplayed(ref we) => {
                 base.join(&format!("element/{}/displayed", we.id))
             },
+            WebDriverCommand::IsEnabled(ref we) => {
+                base.join(&format!("element/{}/enabled", we.id))
+            },
             WebDriverCommand::GetElementProperty(ref we, ref prop) => {
                 base.join(&format!("element/{}/property/{}", we.id, prop))
             }

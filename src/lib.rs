@@ -1007,6 +1007,16 @@ impl Element {
         }
     }
 
+    /// Determine if an element is currently enabled
+    pub async fn enabled(&self) -> Result<bool, error::CmdError> {
+        let cmd = WebDriverCommand::IsEnabled(self.e.clone());
+        let v = self.c.clone().issue(cmd).await?;
+        match v {
+            Json::Bool(v) => Ok(v),
+            v => Err(error::CmdError::NotW3C(v)),
+        }
+    }
+
     /// Find an element on the page.
     pub async fn find(&self, search: Locator<'_>) -> Result<Element, error::CmdError> {
         by(self.c.clone(), search.into(), Some(self.e.clone())).await
