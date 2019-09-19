@@ -1127,7 +1127,8 @@ impl Form {
              button[type=submit][value=\"{}\" i]",
             escaped, escaped
         );
-        self.submit_with(Locator::Css(&btn)).await
+        let result = self.submit_with(Locator::Css(&btn)).await;
+        result
     }
 
     /// Submit this form directly, without clicking any buttons.
