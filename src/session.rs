@@ -795,6 +795,7 @@ impl Session {
                             "no such cookie" => ErrorStatus::NoSuchCookie,
                             "invalid session id" => ErrorStatus::InvalidSessionId,
                             "no such element" => ErrorStatus::NoSuchElement,
+                            "stale element reference" => ErrorStatus::StaleElementReference,
                             _ => unreachable!(
                                 "received unknown error ({}) for NOT_FOUND status code",
                                 error
