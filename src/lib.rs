@@ -239,6 +239,14 @@ impl Client {
         Session::with_capabilities(webdriver, cap).await
     }
 
+    /// Create a new `Client` associated a exist WebDriver session
+    pub async fn with_session_id(
+        webdriver: &str,
+        session_id: String,
+    ) -> Result<Client, error::NewSessionError> {
+        Session::with_session_id(webdriver, session_id).await
+    }
+
     /// Get the session ID assigned by the WebDriver server to this client.
     pub async fn session_id(&mut self) -> Result<Option<String>, error::CmdError> {
         match self.issue(Cmd::GetSessionId).await? {
