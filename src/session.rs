@@ -1,5 +1,5 @@
 use crate::error;
-use futures_core::{ready, Future, Poll};
+use futures_core::{ready, Future, task::Poll};
 use futures_util::future::{self, Either};
 use futures_util::{FutureExt, TryFutureExt, TryStreamExt};
 use serde_json::Value as Json;
@@ -459,6 +459,12 @@ impl Session {
             WebDriverCommand::GetCookies => base.join("cookie"),
             WebDriverCommand::ExecuteScript(..) if self.is_legacy => base.join("execute"),
             WebDriverCommand::ExecuteScript(..) => base.join("execute/sync"),
+            WebDriverCommand::IsDisplayed(ref we) => {
+                base.join(&format!("element/{}/displayed", we.0))
+            },
+            WebDriverCommand::IsEnabled(ref we) => {
+                base.join(&format!("element/{}/enabled", we.0))
+            },
             WebDriverCommand::GetElementProperty(ref we, ref prop) => {
                 base.join(&format!("element/{}/property/{}", we.0, prop))
             }
@@ -752,6 +758,7 @@ impl Session {
                             "no such cookie" => ErrorStatus::NoSuchCookie,
                             "invalid session id" => ErrorStatus::InvalidSessionId,
                             "no such element" => ErrorStatus::NoSuchElement,
+                            "stale element reference" => ErrorStatus::StaleElementReference,
                             _ => unreachable!(
                                 "received unknown error ({}) for NOT_FOUND status code",
                                 error
