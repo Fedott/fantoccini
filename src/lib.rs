@@ -85,7 +85,7 @@
 //!
 //! ```no_run
 //! # extern crate tokio;
-//! # extern crate futures_util;
+//! # extern crate futures;
 //! # extern crate fantoccini;
 //! # use fantoccini::{Client, Locator};
 //! # #[tokio::main]
@@ -122,8 +122,8 @@
 //! [`geckodriver`]: https://github.com/mozilla/geckodriver
 #![deny(missing_docs)]
 
-use http::HttpTryFrom;
 use serde_json::Value as Json;
+use futures::{Future};
 use tokio::prelude::*;
 use tokio::sync::oneshot;
 use webdriver::command::{SendKeysParameters, WebDriverCommand};
@@ -189,6 +189,7 @@ impl<'a> Into<webdriver::command::LocatorParameters> for Locator<'a> {
 }
 
 pub use crate::session::Client;
+use std::convert::TryFrom;
 
 /// A single element on the current page.
 #[derive(Clone)]
@@ -658,11 +659,11 @@ impl Client {
         }
 
         let mut req = hyper::Request::builder();
-        req.method(method)
-            .uri(http::Uri::try_from(url.as_str()).unwrap());
-        req.header(hyper::header::COOKIE, jar.join("; "));
+        req = req.method(method)
+            .uri(http::Uri::try_from(url.as_str()).unwrap())
+            .header(hyper::header::COOKIE, jar.join("; "));
         if let Some(s) = ua {
-            req.header(hyper::header::USER_AGENT, s);
+            req = req.header(hyper::header::USER_AGENT, s);
         }
         let req = before(req);
         let (tx, rx) = oneshot::channel();

@@ -1,7 +1,5 @@
 use crate::error;
-use futures_core::{ready, Future, task::Poll};
-use futures_util::future::{self, Either};
-use futures_util::{FutureExt, TryFutureExt, TryStreamExt};
+use futures::{ready, Future, task::Poll, future::{Either, FutureExt, TryFutureExt, err}, stream::TryStreamExt, StreamExt};
 use serde_json::Value as Json;
 use std::io;
 use std::mem;
@@ -11,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use webdriver::command::WebDriverCommand;
 use webdriver::error::ErrorStatus;
 use webdriver::error::WebDriverError;
+use hyper::client::ResponseFuture;
 
 type Ack = oneshot::Sender<Result<Json, error::CmdError>>;
 
@@ -57,7 +56,7 @@ impl Client {
     {
         let (tx, rx) = oneshot::channel();
         let cmd = cmd.into();
-        let r = self.tx.try_send(Task {
+        let r = self.tx.send(Task {
             request: cmd,
             ack: tx,
         });
@@ -94,7 +93,7 @@ enum Ongoing {
     },
     WebDriver {
         ack: Ack,
-        fut: Pin<Box<dyn Future<Output = Result<Json, error::CmdError>> + Send>>,
+        fut: Pin<Box<dyn Future<Output = Result<Json, error::CmdError>> + Send + 'static>>,
     },
     Raw {
         ack: Ack,
@@ -238,18 +237,33 @@ impl Future for Session {
                         // explicit client shutdown
                         self.shutdown(Some(ack));
                     }
-                    Cmd::WebDriver(request) => {
+                    Cmd::WebDriver(command) => {
                         // looks like the client setup is falling back to legacy params
                         // keep track of that for later
                         if let WebDriverCommand::NewSession(
                             webdriver::command::NewSessionParameters::Legacy(..),
-                        ) = request
+                        ) = command
                         {
                             self.is_legacy = true;
                         }
-                        self.ongoing = Ongoing::WebDriver {
-                            ack,
-                            fut: Box::pin(self.issue_wd_cmd(request)),
+                        let is_new_session = if let WebDriverCommand::NewSession(..) = command {
+                            true
+                        } else {
+                            false
+                        };
+                        let fut = match self.make_wb_cmd_request(command) {
+                            Ok(request) => {
+                                self.ongoing = Ongoing::WebDriver {
+                                    ack,
+                                    fut: Box::pin(Self::issue_wd_cmd(request, is_new_session, self.is_legacy)),
+                                };
+                            },
+                            Err(e) => {
+                                self.ongoing = Ongoing::WebDriver {
+                                    ack,
+                                    fut: Box::pin(err(e)),
+                                };
+                            }
                         };
                     }
                 };
@@ -333,7 +347,7 @@ impl Session {
 
         // We want a tls-enabled client
         let client = hyper::Client::builder()
-            .build::<_, hyper::Body>(hyper_tls::HttpsConnector::new().unwrap());
+            .build::<_, hyper::Body>(hyper_tls::HttpsConnector::new());
 
         // We're going to need a channel for sending requests to the WebDriver host
         let (tx, rx) = mpsc::unbounded_channel();
@@ -372,7 +386,7 @@ impl Session {
 
         // We want a tls-enabled client
         let client = hyper::Client::builder()
-            .build::<_, hyper::Body>(hyper_tls::HttpsConnector::new().unwrap());
+            .build::<_, hyper::Body>(hyper_tls::HttpsConnector::new());
 
         // We're going to need a channel for sending requests to the WebDriver host
         let (tx, rx) = mpsc::unbounded_channel();
@@ -538,19 +552,187 @@ impl Session {
     /// encoded arguments (if any) into the body.
     ///
     /// [the spec]: https://www.w3.org/TR/webdriver/#list-of-endpoints
-    fn issue_wd_cmd(
+    async fn issue_wd_cmd(
+        req: ResponseFuture,
+        is_new_session: bool,
+        legacy: bool,
+    ) -> Result<Json, error::CmdError> {
+        let response = req.await?;
+
+        let status = response.status();
+        let ctype = response
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|ctype| ctype.to_str().ok()?.parse::<mime::Mime>().ok());
+
+        let body = hyper::body::to_bytes(response.into_body()).await?;
+        let body = String::from_utf8(body.to_vec()).expect("non utf-8 response from webdriver");
+
+        if let Some(ctype) = ctype {
+            if ctype.type_() != mime::APPLICATION_JSON.type_() || ctype.subtype() != mime::APPLICATION_JSON.subtype() {
+                // nope, something else...
+                return Err(error::CmdError::NotJson(body))
+            }
+        } else {
+            // WebDriver host sent us something weird...
+            return Err(error::CmdError::NotJson(body))
+        }
+
+        let mut is_success = status.is_success();
+        let mut legacy_status = 0;
+
+        // https://www.w3.org/TR/webdriver/#dfn-send-a-response
+        // NOTE: the standard specifies that even errors use the "Send a Reponse" steps
+        let body = match serde_json::from_str(&*body)? {
+            Json::Object(mut v) => {
+                if legacy {
+                    legacy_status = v["status"].as_u64().unwrap();
+                    is_success = legacy_status == 0;
+                }
+
+                if legacy && is_new_session {
+                    // legacy implementations do not wrap sessionId inside "value"
+                    Ok(Json::Object(v))
+                } else {
+                    v.remove("value")
+                        .ok_or_else(|| error::CmdError::NotW3C(Json::Object(v)))
+                }
+            }
+            v => Err(error::CmdError::NotW3C(v)),
+        }?;
+
+        if is_success {
+            return Ok(body);
+        }
+
+        // https://www.w3.org/TR/webdriver/#dfn-send-an-error
+        // https://www.w3.org/TR/webdriver/#handling-errors
+        let mut body = match body {
+            Json::Object(o) => o,
+            j => return Err(error::CmdError::NotW3C(j)),
+        };
+
+        // phantomjs injects a *huge* field with the entire screen contents -- remove that
+        body.remove("screen");
+
+        let es = if legacy {
+            // old clients use status codes instead of "error", and we now have to map them
+            // https://github.com/SeleniumHQ/selenium/wiki/JsonWireProtocol#response-status-codes
+            if !body.contains_key("message") || !body["message"].is_string() {
+                return Err(error::CmdError::NotW3C(Json::Object(body)));
+            }
+            match legacy_status {
+                6 | 33 => ErrorStatus::SessionNotCreated,
+                7 => ErrorStatus::NoSuchElement,
+                8 => ErrorStatus::NoSuchFrame,
+                9 => ErrorStatus::UnknownCommand,
+                10 => ErrorStatus::StaleElementReference,
+                11 => ErrorStatus::ElementNotInteractable,
+                12 => ErrorStatus::InvalidElementState,
+                13 => ErrorStatus::UnknownError,
+                15 => ErrorStatus::ElementNotSelectable,
+                17 => ErrorStatus::JavascriptError,
+                19 | 32 => ErrorStatus::InvalidSelector,
+                21 => ErrorStatus::Timeout,
+                23 => ErrorStatus::NoSuchWindow,
+                24 => ErrorStatus::InvalidCookieDomain,
+                25 => ErrorStatus::UnableToSetCookie,
+                26 => ErrorStatus::UnexpectedAlertOpen,
+                27 => ErrorStatus::NoSuchAlert,
+                28 => ErrorStatus::ScriptTimeout,
+                29 => ErrorStatus::InvalidCoordinates,
+                34 => ErrorStatus::MoveTargetOutOfBounds,
+                _ => return Err(error::CmdError::NotW3C(Json::Object(body))),
+            }
+        } else {
+            if !body.contains_key("error")
+                || !body.contains_key("message")
+                || !body["error"].is_string()
+                || !body["message"].is_string()
+            {
+                return Err(error::CmdError::NotW3C(Json::Object(body)));
+            }
+
+            use hyper::StatusCode;
+            let error = body["error"].as_str().unwrap();
+            match status {
+                StatusCode::BAD_REQUEST => match error {
+                    "element click intercepted" => ErrorStatus::ElementClickIntercepted,
+                    "element not selectable" => ErrorStatus::ElementNotSelectable,
+                    "element not interactable" => ErrorStatus::ElementNotInteractable,
+                    "insecure certificate" => ErrorStatus::InsecureCertificate,
+                    "invalid argument" => ErrorStatus::InvalidArgument,
+                    "invalid cookie domain" => ErrorStatus::InvalidCookieDomain,
+                    "invalid coordinates" => ErrorStatus::InvalidCoordinates,
+                    "invalid element state" => ErrorStatus::InvalidElementState,
+                    "invalid selector" => ErrorStatus::InvalidSelector,
+                    "no such alert" => ErrorStatus::NoSuchAlert,
+                    "no such frame" => ErrorStatus::NoSuchFrame,
+                    "no such window" => ErrorStatus::NoSuchWindow,
+                    "stale element reference" => ErrorStatus::StaleElementReference,
+                    _ => unreachable!(
+                        "received unknown error ({}) for BAD_REQUEST status code",
+                        error
+                    ),
+                },
+                StatusCode::NOT_FOUND => match error {
+                    "unknown command" => ErrorStatus::UnknownCommand,
+                    "no such cookie" => ErrorStatus::NoSuchCookie,
+                    "invalid session id" => ErrorStatus::InvalidSessionId,
+                    "no such element" => ErrorStatus::NoSuchElement,
+                    "stale element reference" => ErrorStatus::StaleElementReference,
+                    _ => unreachable!(
+                        "received unknown error ({}) for NOT_FOUND status code",
+                        error
+                    ),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR => match error {
+                    "javascript error" => ErrorStatus::JavascriptError,
+                    "move target out of bounds" => ErrorStatus::MoveTargetOutOfBounds,
+                    "session not created" => ErrorStatus::SessionNotCreated,
+                    "unable to set cookie" => ErrorStatus::UnableToSetCookie,
+                    "unable to capture screen" => ErrorStatus::UnableToCaptureScreen,
+                    "unexpected alert open" => ErrorStatus::UnexpectedAlertOpen,
+                    "unknown error" => ErrorStatus::UnknownError,
+                    "unsupported operation" => ErrorStatus::UnsupportedOperation,
+                    _ => unreachable!(
+                        "received unknown error ({}) for INTERNAL_SERVER_ERROR status code",
+                        error
+                    ),
+                },
+                StatusCode::REQUEST_TIMEOUT => match error {
+                    "timeout" => ErrorStatus::Timeout,
+                    "script timeout" => ErrorStatus::ScriptTimeout,
+                    _ => unreachable!(
+                        "received unknown error ({}) for REQUEST_TIMEOUT status code",
+                        error
+                    ),
+                },
+                StatusCode::METHOD_NOT_ALLOWED => match error {
+                    "unknown method" => ErrorStatus::UnknownMethod,
+                    _ => unreachable!(
+                        "received unknown error ({}) for METHOD_NOT_ALLOWED status code",
+                        error
+                    ),
+                },
+                _ => unreachable!("received unknown status code: {}", status),
+            }
+        };
+
+        let message = body["message"].as_str().unwrap().to_string();
+        Err(error::CmdError::from(WebDriverError::new(es, message)))
+    }
+
+    fn make_wb_cmd_request(
         &mut self,
         cmd: WebDriverCommand<webdriver::command::VoidWebDriverExtensionCommand>,
-    ) -> impl Future<Output = Result<Json, error::CmdError>> {
-        // TODO: make this an async fn
-        // will take some doing as returned future must be independent of self
-
+    ) -> Result<ResponseFuture, error::CmdError> {
         use webdriver::command;
 
         // most actions are just get requests with not parameters
         let url = match self.endpoint_for(&cmd) {
             Ok(url) => url,
-            Err(e) => return Either::Right(future::err(error::CmdError::from(e))),
+            Err(e) => return Err(error::CmdError::from(e)),
         };
         use hyper::Method;
         let mut method = Method::GET;
@@ -619,14 +801,14 @@ impl Session {
         }
 
         // issue the command to the webdriver server
-        let mut req = hyper::Request::builder();
-        req.method(method).uri(url.as_str());
+        let mut req = hyper::Request::builder()
+            .method(method).uri(url.as_str());
         if let Some(ref s) = self.ua {
-            req.header(hyper::header::USER_AGENT, s.to_owned());
+            req = req.header(hyper::header::USER_AGENT, s.to_owned());
         }
         // because https://github.com/hyperium/hyper/pull/727
         if !url.username().is_empty() || url.password().is_some() {
-            req.header(
+            req = req.header(
                 hyper::header::AUTHORIZATION,
                 format!(
                     "Basic {}",
@@ -640,206 +822,13 @@ impl Session {
         }
 
         let req = if let Some(body) = body.take() {
-            req.header(hyper::header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref());
-            req.header(hyper::header::CONTENT_LENGTH, body.len());
+            req = req.header(hyper::header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+                .header(hyper::header::CONTENT_LENGTH, body.len());
             self.client.request(req.body(body.into()).unwrap())
         } else {
             self.client.request(req.body(hyper::Body::empty()).unwrap())
         };
 
-        let legacy = self.is_legacy;
-        let f = req
-            .map_err(error::CmdError::from)
-            .and_then(move |res| {
-                // keep track of result status (.body() consumes self -- ugh)
-                let status = res.status();
-
-                // check that the server sent us json
-                let ctype = res
-                    .headers()
-                    .get(hyper::header::CONTENT_TYPE)
-                    .and_then(|ctype| ctype.to_str().ok()?.parse::<mime::Mime>().ok());
-
-                // What did the server send us?
-                res.into_body()
-                    .try_concat()
-                    .map_ok(move |body| (body, ctype, status))
-                    .map_err(|e| -> error::CmdError { e.into() })
-            })
-            .map(|r| {
-                let (body, ctype, status) = r?;
-
-                // Too bad we can't stream into a String :(
-                let body =
-                    String::from_utf8(body.to_vec()).expect("non utf-8 response from webdriver");
-
-                if let Some(ctype) = ctype {
-                    if ctype.type_() == mime::APPLICATION_JSON.type_()
-                        && ctype.subtype() == mime::APPLICATION_JSON.subtype()
-                    {
-                        Ok((body, status))
-                    } else {
-                        // nope, something else...
-                        Err(error::CmdError::NotJson(body))
-                    }
-                } else {
-                    // WebDriver host sent us something weird...
-                    Err(error::CmdError::NotJson(body))
-                }
-            })
-            .map(move |r| {
-                let (body, status) = r?;
-                let is_new_session = if let WebDriverCommand::NewSession(..) = cmd {
-                    true
-                } else {
-                    false
-                };
-
-                let mut is_success = status.is_success();
-                let mut legacy_status = 0;
-
-                // https://www.w3.org/TR/webdriver/#dfn-send-a-response
-                // NOTE: the standard specifies that even errors use the "Send a Reponse" steps
-                let body = match serde_json::from_str(&*body)? {
-                    Json::Object(mut v) => {
-                        if legacy {
-                            legacy_status = v["status"].as_u64().unwrap();
-                            is_success = legacy_status == 0;
-                        }
-
-                        if legacy && is_new_session {
-                            // legacy implementations do not wrap sessionId inside "value"
-                            Ok(Json::Object(v))
-                        } else {
-                            v.remove("value")
-                                .ok_or_else(|| error::CmdError::NotW3C(Json::Object(v)))
-                        }
-                    }
-                    v => Err(error::CmdError::NotW3C(v)),
-                }?;
-
-                if is_success {
-                    return Ok(body);
-                }
-
-                // https://www.w3.org/TR/webdriver/#dfn-send-an-error
-                // https://www.w3.org/TR/webdriver/#handling-errors
-                let mut body = match body {
-                    Json::Object(o) => o,
-                    j => return Err(error::CmdError::NotW3C(j)),
-                };
-
-                // phantomjs injects a *huge* field with the entire screen contents -- remove that
-                body.remove("screen");
-
-                let es = if legacy {
-                    // old clients use status codes instead of "error", and we now have to map them
-                    // https://github.com/SeleniumHQ/selenium/wiki/JsonWireProtocol#response-status-codes
-                    if !body.contains_key("message") || !body["message"].is_string() {
-                        return Err(error::CmdError::NotW3C(Json::Object(body)));
-                    }
-                    match legacy_status {
-                        6 | 33 => ErrorStatus::SessionNotCreated,
-                        7 => ErrorStatus::NoSuchElement,
-                        8 => ErrorStatus::NoSuchFrame,
-                        9 => ErrorStatus::UnknownCommand,
-                        10 => ErrorStatus::StaleElementReference,
-                        11 => ErrorStatus::ElementNotInteractable,
-                        12 => ErrorStatus::InvalidElementState,
-                        13 => ErrorStatus::UnknownError,
-                        15 => ErrorStatus::ElementNotSelectable,
-                        17 => ErrorStatus::JavascriptError,
-                        19 | 32 => ErrorStatus::InvalidSelector,
-                        21 => ErrorStatus::Timeout,
-                        23 => ErrorStatus::NoSuchWindow,
-                        24 => ErrorStatus::InvalidCookieDomain,
-                        25 => ErrorStatus::UnableToSetCookie,
-                        26 => ErrorStatus::UnexpectedAlertOpen,
-                        27 => ErrorStatus::NoSuchAlert,
-                        28 => ErrorStatus::ScriptTimeout,
-                        29 => ErrorStatus::InvalidCoordinates,
-                        34 => ErrorStatus::MoveTargetOutOfBounds,
-                        _ => return Err(error::CmdError::NotW3C(Json::Object(body))),
-                    }
-                } else {
-                    if !body.contains_key("error")
-                        || !body.contains_key("message")
-                        || !body["error"].is_string()
-                        || !body["message"].is_string()
-                    {
-                        return Err(error::CmdError::NotW3C(Json::Object(body)));
-                    }
-
-                    use hyper::StatusCode;
-                    let error = body["error"].as_str().unwrap();
-                    match status {
-                        StatusCode::BAD_REQUEST => match error {
-                            "element click intercepted" => ErrorStatus::ElementClickIntercepted,
-                            "element not selectable" => ErrorStatus::ElementNotSelectable,
-                            "element not interactable" => ErrorStatus::ElementNotInteractable,
-                            "insecure certificate" => ErrorStatus::InsecureCertificate,
-                            "invalid argument" => ErrorStatus::InvalidArgument,
-                            "invalid cookie domain" => ErrorStatus::InvalidCookieDomain,
-                            "invalid coordinates" => ErrorStatus::InvalidCoordinates,
-                            "invalid element state" => ErrorStatus::InvalidElementState,
-                            "invalid selector" => ErrorStatus::InvalidSelector,
-                            "no such alert" => ErrorStatus::NoSuchAlert,
-                            "no such frame" => ErrorStatus::NoSuchFrame,
-                            "no such window" => ErrorStatus::NoSuchWindow,
-                            "stale element reference" => ErrorStatus::StaleElementReference,
-                            _ => unreachable!(
-                                "received unknown error ({}) for BAD_REQUEST status code",
-                                error
-                            ),
-                        },
-                        StatusCode::NOT_FOUND => match error {
-                            "unknown command" => ErrorStatus::UnknownCommand,
-                            "no such cookie" => ErrorStatus::NoSuchCookie,
-                            "invalid session id" => ErrorStatus::InvalidSessionId,
-                            "no such element" => ErrorStatus::NoSuchElement,
-                            "stale element reference" => ErrorStatus::StaleElementReference,
-                            _ => unreachable!(
-                                "received unknown error ({}) for NOT_FOUND status code",
-                                error
-                            ),
-                        },
-                        StatusCode::INTERNAL_SERVER_ERROR => match error {
-                            "javascript error" => ErrorStatus::JavascriptError,
-                            "move target out of bounds" => ErrorStatus::MoveTargetOutOfBounds,
-                            "session not created" => ErrorStatus::SessionNotCreated,
-                            "unable to set cookie" => ErrorStatus::UnableToSetCookie,
-                            "unable to capture screen" => ErrorStatus::UnableToCaptureScreen,
-                            "unexpected alert open" => ErrorStatus::UnexpectedAlertOpen,
-                            "unknown error" => ErrorStatus::UnknownError,
-                            "unsupported operation" => ErrorStatus::UnsupportedOperation,
-                            _ => unreachable!(
-                                "received unknown error ({}) for INTERNAL_SERVER_ERROR status code",
-                                error
-                            ),
-                        },
-                        StatusCode::REQUEST_TIMEOUT => match error {
-                            "timeout" => ErrorStatus::Timeout,
-                            "script timeout" => ErrorStatus::ScriptTimeout,
-                            _ => unreachable!(
-                                "received unknown error ({}) for REQUEST_TIMEOUT status code",
-                                error
-                            ),
-                        },
-                        StatusCode::METHOD_NOT_ALLOWED => match error {
-                            "unknown method" => ErrorStatus::UnknownMethod,
-                            _ => unreachable!(
-                                "received unknown error ({}) for METHOD_NOT_ALLOWED status code",
-                                error
-                            ),
-                        },
-                        _ => unreachable!("received unknown status code: {}", status),
-                    }
-                };
-
-                let message = body["message"].as_str().unwrap().to_string();
-                Err(error::CmdError::from(WebDriverError::new(es, message)))
-            });
-
-        Either::Left(f)
+        Ok(req)
     }
 }
