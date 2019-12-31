@@ -5,8 +5,6 @@ extern crate fantoccini;
 use fantoccini::{error, Client, Locator, Method};
 
 use futures::future::try_join_all;
-use futures::{TryFutureExt, StreamExt};
-use futures::TryStreamExt;
 use std::time::Duration;
 use url::Url;
 

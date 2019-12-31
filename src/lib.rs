@@ -124,7 +124,6 @@
 
 use serde_json::Value as Json;
 use futures::{Future};
-use tokio::prelude::*;
 use tokio::sync::oneshot;
 use webdriver::command::{SendKeysParameters, WebDriverCommand};
 use webdriver::common::ELEMENT_KEY;
@@ -569,7 +568,7 @@ impl Client {
         method: Method,
         url: &str,
     ) -> Result<hyper::Response<hyper::Body>, error::CmdError> {
-        self.with_raw_client_for(method, url, |mut req| {
+        self.with_raw_client_for(method, url, |req| {
             req.body(hyper::Body::empty()).unwrap()
         })
         .await

@@ -1,5 +1,5 @@
 use crate::error;
-use futures::{ready, Future, task::Poll, future::{Either, FutureExt, TryFutureExt, err}, stream::TryStreamExt, StreamExt};
+use futures::{ready, Future, task::Poll, future::{FutureExt, err}};
 use serde_json::Value as Json;
 use std::io;
 use std::mem;
@@ -251,7 +251,7 @@ impl Future for Session {
                         } else {
                             false
                         };
-                        let fut = match self.make_wb_cmd_request(command) {
+                        let _fut = match self.make_wb_cmd_request(command) {
                             Ok(request) => {
                                 self.ongoing = Ongoing::WebDriver {
                                     ack,
