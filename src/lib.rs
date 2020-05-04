@@ -193,6 +193,8 @@ impl<'a> From<Locator<'a>> for webdriver::command::LocatorParameters {
 }
 
 pub use crate::session::Client;
+use std::time::Instant;
+use tokio::time::Duration;
 
 /// A single element on the current page.
 #[derive(Clone, Debug)]
@@ -727,6 +729,27 @@ impl Client {
         Ok(())
     }
 
+    /// Wait for the given function to return `true` before proceeding.
+    ///
+    /// This can be useful to wait for something to appear on the page before interacting with it.
+    /// While this currently just spins and yields, it may be more efficient than this in the
+    /// future. In particular, in time, it may only run `is_ready` again when an event occurs on
+    /// the page.
+    pub async fn wait_for_timeout<F, FF>(&mut self, mut is_ready: F, timeout: Duration) -> Result<(), error::CmdError>
+        where
+            F: FnMut(&mut Client) -> FF,
+            FF: Future<Output = Result<bool, error::CmdError>>,
+    {
+        let deadline = Instant::now() + timeout;
+
+        while !is_ready(self).await? {
+            if Instant::now() >= deadline {
+                return Err(error::CmdError::TimeoutExceeded)
+            }
+        }
+        Ok(())
+    }
+
     /// Wait for the given element to be present on the page.
     ///
     /// This can be useful to wait for something to appear on the page before interacting with it.
@@ -745,6 +768,34 @@ impl Client {
             {
                 Ok(v) => break Ok(v),
                 Err(error::CmdError::NoSuchElement(_)) => {}
+                Err(e) => break Err(e),
+            }
+        }
+    }
+
+    /// Wait for the given element to be present on the page.
+    ///
+    /// This can be useful to wait for something to appear on the page before interacting with it.
+    /// While this currently just spins and yields, it may be more efficient than this in the
+    /// future. In particular, in time, it may only run `is_ready` again when an event occurs on
+    /// the page.
+    pub async fn wait_for_find_timeout(&mut self, search: Locator<'_>, timeout: Duration) -> Result<Element, error::CmdError> {
+        let s: webdriver::command::LocatorParameters = search.into();
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .by(webdriver::command::LocatorParameters {
+                    using: s.using,
+                    value: s.value.clone(),
+                })
+                .await
+            {
+                Ok(v) => break Ok(v),
+                Err(error::CmdError::NoSuchElement(_)) => {
+                    if Instant::now() >= deadline {
+                        break Err(error::CmdError::TimeoutExceeded)
+                    }
+                }
                 Err(e) => break Err(e),
             }
         }
@@ -1177,6 +1228,50 @@ impl Element {
     {
         while !is_ready(&mut self).await? {}
         Ok(self)
+    }
+
+    /// Wait for the given function to return `true` before proceeding.
+    ///
+    /// This can be useful to wait for something to appear on the page before interacting with it.
+    /// While this currently just spins and yields, it may be more efficient than this in the
+    /// future. In particular, in time, it may only run `is_ready` again when an event occurs on
+    /// the page.
+    pub async fn wait_for_timeout<F, FF>(mut self, mut is_ready: F, timeout: Duration) -> Result<Self, error::CmdError>
+        where
+            F: FnMut(&mut Element) -> FF,
+            FF: Future<Output = Result<bool, error::CmdError>>,
+    {
+        let deadline = Instant::now() + timeout;
+        while !is_ready(&mut self).await? {
+            if Instant::now() >= deadline {
+                return Err(error::CmdError::TimeoutExceeded)
+            }
+        }
+        Ok(self)
+    }
+
+    /// Wait for the given element to be present on the page.
+    ///
+    /// This can be useful to wait for something to appear on the page before interacting with it.
+    /// While this currently just spins and yields, it may be more efficient than this in the
+    /// future. In particular, in time, it may only run `is_ready` again when an event occurs on
+    /// the page.
+    pub async fn wait_for_find_timeout(&mut self, search: Locator<'_>, timeout: Duration) -> Result<Element, error::CmdError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .find(search)
+                .await
+            {
+                Ok(v) => break Ok(v),
+                Err(error::CmdError::NoSuchElement(_)) => {
+                    if Instant::now() >= deadline {
+                        break Err(error::CmdError::TimeoutExceeded)
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        }
     }
 }
 
